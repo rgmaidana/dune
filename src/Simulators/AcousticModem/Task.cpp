@@ -24,110 +24,245 @@
 // https://github.com/LSTS/dune/blob/master/LICENCE.md and                  *
 // http://ec.europa.eu/idabc/eupl.html.                                     *
 //***************************************************************************
-// Author: José Braga                                                       *
+// Author: Eduardo Marques                                                  *
+// Author: Luis Venancio                                                    *
 //***************************************************************************
+
+// ISO C++ 98 headers.
+#include <cstdlib>
+#include <cmath>
+#include <map>
+#include <iomanip>
 
 // DUNE headers.
 #include <DUNE/DUNE.hpp>
 
 namespace Simulators
 {
-  //! This task simulates a (simplified) acoustic modem. It implements
-  //! acoustic transmission via a secondary UDP client/server (alternative
-  //! to Transports::UDP).
-  //!
-  //! Transmission requests coming in the form of DUNE::IMC::UamTxFrame are
-  //! translated into DUNE::IMC::AcousticMessage structures and are then sent
-  //! via UDP to a (parametrized) remote UDP address. The same UDP socked is
-  //! used to receive DUNE::IMC::AcousticMessage from the remote peer which
-  //! are translated to DUNE::IMC::UamRxFrame
-  //!
-  //! @author José Braga
   namespace AcousticModem
   {
     using DUNE_NAMESPACES;
 
     struct Arguments
     {
-      //! Local UDP port to listen to datagrams containing IMC::DUNE::AcousticMessage
-      uint16_t local_port;
-      //! IPv4 Address of the remote DUNE system also running this task
-      Address addr;
-      //! Remote port of the remote DUNE system also running this task
-      uint16_t port;
+      //! Multicast Address
+      Address udp_maddr;
+      //! UDP port
+      uint16_t udp_port;
+
+      //! Location of static device
+      std::vector<double> location;
+
+      //! Modem type.
+      std::string mtype;
+      //! Trasmission speed.
+      uint16_t tx_speed;
+
+      //! Standard deviation for distance probability.
+      fp32_t dst_peak_width;
+      //! Standard deviation for data size probability.
+      fp32_t dsize_peak_width;
+      //! PRNG type.
+      std::string prng_type;
+      //! PRNG seed.
+      int prng_seed;
     };
 
-    struct Task: public DUNE::Tasks::Task
+    static const double c_sound_speed = 1500;
+    static const double c_max_range = 3000;
+
+    struct Task: public Tasks::Task
     {
-      //! Buffer capacity.
-      static const unsigned c_bfr_size = 255;
-      // Task arguments.
+      //! Task arguments.
       Arguments m_args;
-      // UDP Socket.
+
+      //! Static device flag.
+      bool m_fixed_location;
+
+      //! UDP socket.
       UDPSocket* m_sock;
-      //! Read buffer.
-      std::vector<uint8_t> m_bfr;
+      //! UDP message buffer.
+      uint8_t m_buf[1024];
 
-      //! Constructor.
-      //! @param[in] name task name.
-      //! @param[in] ctx context.
+      //! Delivery queue.
+      //! <time of delivery, message to release*>
+      typedef std::map<double, IMC::UamRxFrame*> ReceiveMap;
+      ReceiveMap m_queue;
+      //! Local simulated state.
+      IMC::SimulatedState m_lstate;      
+      //! PRNG handle.
+      Random::Generator* m_prng;
+
       Task(const std::string& name, Tasks::Context& ctx):
-        DUNE::Tasks::Task(name, ctx),
-        m_sock(NULL)
+        Tasks::Task(name, ctx),
+        m_fixed_location(false),
+        m_sock(0),
+        m_prng(NULL)
       {
-        param("Local Port", m_args.local_port)
-        .defaultValue("6021")
-        .minimumValue("0")
-        .maximumValue("65535")
-        .description("Local UDP port");
+        param("UDP Communications -- Multicast Address", m_args.udp_maddr)
+        .defaultValue("225.0.2.1")
+        .description("UDP multicast address for communications");
 
-        param("Destination UDP Address", m_args.addr)
-        .defaultValue("172.0.0.1")
-        .description("IP address of remote system");
+        param("UDP Communications -- Port", m_args.udp_port)
+        .defaultValue("8021")
+        .description("UDP port for communications");
 
-        param("Destination UDP Port", m_args.port)
-        .defaultValue("6022")
-        .minimumValue("0")
-        .maximumValue("65535")
-        .description("UDP port of remote system");
+        param("Fixed Location", m_args.location)
+        .defaultValue("")
+        .description("WGS84 latitude and longitude for node with fixed position");
 
-        m_bfr.resize(c_bfr_size);
+        param("Modem Type", m_args.mtype)
+        .description("Vehicle modem type (Ex. Evologics, Seatrac)");
 
+        param("Transmission Speed", m_args.tx_speed)
+        .description("Modem transmission speed (bps)");
+
+        param("Distance Standard Deviation", m_args.dst_peak_width)
+        .defaultValue("1000");
+
+        param("Size Standard Deviation", m_args.dsize_peak_width)
+        .defaultValue("21");
+
+        param("PRNG Type", m_args.prng_type)
+        .defaultValue(Random::Factory::c_default);
+
+        param("PRNG Seed", m_args.prng_seed)
+        .defaultValue("-1");
+
+        // Register consumers.
+        bind<IMC::SimulatedState>(this);
         bind<IMC::UamTxFrame>(this);
       }
 
-      //! Update internal state with new parameter values.
+      ~Task(void)
+      {
+        onResourceRelease();
+      }
+
       void
       onUpdateParameters(void)
       {
-        if (isActive())
+        if (m_args.location.size() == 2)
         {
-          if (paramChanged(m_args.addr))
-            throw RestartNeeded(DTR("restarting to change IPv4 address"), 1);
-
-          if (paramChanged(m_args.port))
-            throw RestartNeeded(DTR("restarting to change UDP port"), 1);
+          m_fixed_location = true;
+          m_lstate.clear();
+          m_lstate.lat = Angles::radians(m_args.location[0]);
+          m_lstate.lon = Angles::radians(m_args.location[1]);
+          m_lstate.z = 0;
         }
       }
 
-      //! Acquire resources by binding to the local UDP port.
       void
       onResourceAcquisition(void)
       {
-        m_sock = new UDPSocket;
-        m_sock->bind(m_args.local_port, Address::Any, false);
-        setEntityState(IMC::EntityState::ESTA_NORMAL, Status::CODE_ACTIVE);
+        //Initialize UDP socket in multicast
+        m_sock = new DUNE::Network::UDPSocket();
+        m_sock->setMulticastTTL(1);
+        m_sock->setMulticastLoop(true);
+        m_sock->joinMulticastGroup(m_args.udp_maddr);
+        m_sock->bind(m_args.udp_port);
+
+        //Initialize random number generator
+        m_prng = Random::Factory::create(m_args.prng_type, m_args.prng_seed);
+
+        //Deactivate until SimulatedState message is received
+        requestDeactivation();
       }
 
-      //! Release resources. Clears UDP socket.
       void
       onResourceRelease(void)
       {
-        Memory::clear(m_sock);
+        if (m_sock)
+        {
+          delete m_sock;
+          m_sock = 0;
+        }
+
+        Memory::clear(m_prng);
+        ReceiveMap::iterator it = m_queue.begin();
+        for(; it != m_queue.end(); ++it)
+          Memory::clear(it->second);
       }
 
-      //! Translates transmission request to a DUNE::IMC::AcousticMessage and
-      //! forwards the message to the remote peer.
+      void
+      share(const IMC::Message* msg)
+      {
+        // Share message over the UDP multicast socket.
+        int n = msg->getSerializationSize();
+        IMC::Packet::serialize(msg, m_buf, n);
+        m_sock->write(m_buf, n, m_args.udp_maddr, m_args.udp_port);
+      }
+
+      // Compute distance to source vehicle
+      double
+      distance(IMC::SAMessage* src_state)
+      {
+        //Convert to absolute coordinates
+        fp64_t llat, llon;
+        Coordinates::toWGS84(m_lstate, llat, llon);
+
+        return WGS84::distance(llat, llon, m_lstate.z,
+                               src_state->lat, src_state->lon, src_state->depth);
+      }
+
+      // Simulate delivery failures gausian distribution of distance
+      bool
+      deliverySucceeds(fp64_t distance, uint16_t data_size)
+      {
+        // Out of range
+        if(distance > c_max_range)
+          return 0;
+        
+        // Gaussian profiles
+        fp32_t dist_prob = exp(-1 * (distance*distance)/(2 * m_args.dst_peak_width * m_args.dst_peak_width));
+        fp32_t size_prob = exp(-1 * (fp32_t)(data_size*data_size)/
+                                (2 * m_args.dsize_peak_width * m_args.dsize_peak_width));
+
+        return m_prng->uniform() <= dist_prob*size_prob ? 1 : 0;
+      }
+
+      // Parse SAMessage into UamRxFrame and add to queue
+      void
+      parseRx(IMC::SAMessage* amsg, fp64_t d)
+      {
+        // Create UamRxFrame
+        IMC::UamRxFrame* rx = new UamRxFrame;
+        rx->sys_src = resolveSystemId(amsg->getSource());
+        rx->sys_dst = getSystemName();
+        rx->flags = amsg->flags;
+        rx->data = amsg->data;
+
+        // Simulate time of delivery
+        fp64_t tod = amsg->getTimeStamp()                                         //Start sending
+                    + amsg->data.size()*8/amsg->tspeed   //Time to send last bit
+                    + d/c_sound_speed;                                            //Travel time
+
+        // If t.o.d. has passed: dispatch; otherwise: queue
+        if(tod <= Clock::getSinceEpoch())
+          dispatch(rx);
+        else
+          m_queue.insert(std::pair<double, UamRxFrame*>(tod, rx));
+      }
+
+      void
+      checkMessages()
+      {
+        // Check all messages
+        ReceiveMap::iterator it = m_queue.begin();
+        for(; it != m_queue.end(); ++it)
+          if(it->first <= Clock::getSinceEpoch())
+          {
+            // Set time and dispatch
+            IMC::UamRxFrame* msg = it->second;
+            msg->setTimeStamp();
+            dispatch(msg);
+
+            // Erase message
+            delete msg;
+            m_queue.erase(it);
+          }
+      }
+
       void
       consume(const IMC::UamTxFrame* msg)
       {
@@ -135,71 +270,90 @@ namespace Simulators
         if (msg->getSource() != getSystemId())
           return;
 
-        // Serialize AcousticMessage.
-        IMC::AcousticMessage amsg;
+        // Construct simulated acoustic message metadata
+        IMC::SAMessage amsg;
+        Coordinates::toWGS84(m_lstate, amsg.lat, amsg.lon);
+        amsg.depth = m_lstate.z;
+        amsg.mtype = m_args.mtype;
+        amsg.tspeed = m_args.tx_speed;
+
+        // Copy UamTxFrame data
+        amsg.seq = msg->seq;
+        amsg.sys_dst = msg->sys_dst;
+        amsg.flags = msg->flags;
+        amsg.data = msg->data;
+
+        // Send
         amsg.setSource(getSystemId());
-        amsg.setSourceEntity(getEntityId());
         amsg.setTimeStamp();
-        amsg.message.set(*msg);
-
-        size_t rv = IMC::Packet::serialize(&amsg, (uint8_t*)&m_bfr[0], (uint16_t)m_bfr.size());
-
-        debug("acoustic message to %s", msg->sys_dst.c_str());
-
-        try
-        {
-          m_sock->write((const uint8_t*)&m_bfr[0], rv, m_args.addr, m_args.port);
-        }
-        catch (...)
-        { }
+        share(&amsg);
       }
 
-      //! Read incoming datagrams. If incoming data is a DUNE::IMC::AcousticMessage,
-      //! and contains a DUNE::IMC::UamTxFrame (inline) it gets translated to a
-      //! @publish DUNE::IMC::UamRxFrame and gets posted to the local bus.
       void
-      readData(void)
+      consume(const IMC::SimulatedState* msg)
       {
-        if (!Poll::poll(*m_sock, 1.0))
+        if(m_fixed_location)
           return;
 
-        size_t rv = m_sock->read(&m_bfr[0], m_bfr.size());
-        IMC::Message* msg = IMC::Packet::deserialize((uint8_t*)&m_bfr[0], rv);
+        m_lstate = *msg;
 
-        if (msg->getId() == DUNE_IMC_ACOUSTICMESSAGE)
-        {
-          const IMC::AcousticMessage* am = static_cast<const IMC::AcousticMessage*>(msg);
-          const IMC::Message* m = am->message.get();
-
-          if (m->getId() == DUNE_IMC_UAMTXFRAME)
-          {
-            const IMC::UamTxFrame* frame = static_cast<const IMC::UamTxFrame*>(m);
-
-            // Check if we are the right destination
-            if (resolveSystemName(frame->sys_dst) != getSystemId())
-              return;
-
-            // Process data.
-            IMC::UamRxFrame rx;
-            rx.sys_src = resolveSystemId(msg->getSource());
-            rx.sys_dst = getSystemName();
-            rx.data = frame->data;
-            debug("received acoustic message from %s", rx.sys_src.c_str());
-            dispatch(rx);
-          }
-        }
+        if(!isActive())
+          requestActivation();
       }
 
-      //! Main loop.
       void
       onMain(void)
       {
         while (!stopping())
         {
-          consumeMessages();
+          // Check for messages in queue
+          if (!m_queue.empty())
+            checkMessages();
 
-          if (m_sock != NULL)
-            readData();
+          checkIncomingData();
+          waitForMessages(0.1);
+        }
+      }
+
+      void
+      checkIncomingData(void)
+      {
+        Address dummy;
+
+        try
+        {
+          if (Poll::poll(*m_sock, 0.01))
+          {
+            // Retrieve message
+            size_t n = m_sock->read(m_buf, sizeof(m_buf), &dummy);
+            IMC::Message* m = IMC::Packet::deserialize(m_buf, n);
+
+            // Check if msg is simulated acoustic msg
+            if(m->getId() == DUNE_IMC_SAMESSAGE)
+            {
+              IMC::SAMessage* amsg = static_cast<IMC::SAMessage*>(m);
+
+              // Check destination and modem compatibility
+              bool dst_check = resolveSystemName(amsg->sys_dst) == getSystemId();                    //Specific destination
+              dst_check |= ((amsg->sys_dst == "broadcast") & (amsg->getSource() != getSystemId()));  //All
+              if(dst_check && amsg->mtype == m_args.mtype)
+              {
+                // Check range
+                fp64_t d = distance(amsg);
+                if(deliverySucceeds(d, amsg->data.size()))
+                  parseRx(amsg, d);
+              }
+            }
+            else
+            {
+              err(DTR("unexpected simulation message: %s"), m->getName());
+            }
+            delete m;
+          }
+        }
+        catch (std::runtime_error& e)
+        {
+          err(DTR("read error: %s"), e.what());
         }
       }
     };
