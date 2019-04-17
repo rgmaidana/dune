@@ -56,7 +56,7 @@ namespace Simulators
       //! Modem type.
       std::string mtype;
       //! Trasmission speed.
-      uint16_t tx_speed;
+      int tx_speed;
 
       //! Standard deviation for distance probability.
       fp32_t dst_peak_width;
@@ -218,7 +218,32 @@ namespace Simulators
         fp32_t size_prob = exp(-1 * (fp32_t)(data_size*data_size)/
                                 (2 * m_args.dsize_peak_width * m_args.dsize_peak_width));
 
-        return m_prng->uniform() <= dist_prob*size_prob ? 1 : 0;
+        return m_prng->uniform() <= dist_prob*size_prob;
+      }
+
+      //Check collisions
+      bool
+      checkCollisions(fp64_t toa)
+      {
+        // Check all messages for collisions
+        ReceiveMap::iterator it = m_queue.begin();
+        for(; it != m_queue.end(); ++it)
+        {
+          //If a new message arrives during the rxtime of another message
+          fp64_t q_tod = it->first;
+          fp64_t msg_size = (fp64_t)it->second->data.size()*8;
+          fp64_t q_txtime = msg_size/m_args.tx_speed;
+          fp64_t q_toa = q_tod - q_txtime;
+          if(toa > q_toa && toa < q_tod)
+          {
+            // Erase message
+            delete it->second;
+            m_queue.erase(it);
+            return 1;
+          }
+        }
+
+        return 0;
       }
 
       // Parse SAMessage into UamRxFrame and add to queue
@@ -232,18 +257,20 @@ namespace Simulators
         rx->flags = amsg->flags;
         rx->data = amsg->data;
 
-        // Simulate time of delivery
-        fp64_t tod = amsg->getTimeStamp()                                         //Start sending
-                    + amsg->data.size()*8/amsg->tspeed   //Time to send last bit
-                    + d/c_sound_speed;                                            //Travel time
+        // Time of arrival
+        fp64_t toa = amsg->getTimeStamp()   //Start sending
+                    + d/c_sound_speed;      //Travel time
+        // Time of delivery
+        fp64_t tod = toa + amsg->txtime     //Time to send last bit
 
         // If t.o.d. has passed: dispatch; otherwise: queue
         if(tod <= Clock::getSinceEpoch())
           dispatch(rx);
-        else
+        else if(!checkCollisions(toa))
           m_queue.insert(std::pair<double, UamRxFrame*>(tod, rx));
       }
 
+      //Check if there are messages to deliver
       void
       checkMessages()
       {
@@ -275,7 +302,7 @@ namespace Simulators
         Coordinates::toWGS84(m_lstate, amsg.lat, amsg.lon);
         amsg.depth = m_lstate.z;
         amsg.mtype = m_args.mtype;
-        amsg.tspeed = m_args.tx_speed;
+        amsg.txtime = msg->data.size()*8/m_args.tx_speed;
 
         // Copy UamTxFrame data
         amsg.seq = msg->seq;
@@ -287,6 +314,9 @@ namespace Simulators
         amsg.setSource(getSystemId());
         amsg.setTimeStamp();
         share(&amsg);
+
+        //Send to bus (Logging)
+        dispatch(amsg);
       }
 
       void
@@ -294,11 +324,11 @@ namespace Simulators
       {
         if(m_fixed_location)
           return;
-
-        m_lstate = *msg;
-
+        
         if(!isActive())
           requestActivation();
+
+        m_lstate = *msg;
       }
 
       void
@@ -313,6 +343,21 @@ namespace Simulators
           checkIncomingData();
           waitForMessages(0.1);
         }
+      }
+
+      // Check if message id to be parsed
+      bool
+      toParse(IMC::SAMessage* amsg)
+      {
+        //Check destination
+        bool check;
+        check = resolveSystemName(amsg->sys_dst) == getSystemId();                          //Specific destination
+        check |= ((amsg->sys_dst == "broadcast") & (amsg->getSource() != getSystemId()));   //or All
+
+        //Check modem compatibility
+        check &= amsg->mtype == m_args.mtype;
+
+        return check;
       }
 
       void
@@ -333,10 +378,7 @@ namespace Simulators
             {
               IMC::SAMessage* amsg = static_cast<IMC::SAMessage*>(m);
 
-              // Check destination and modem compatibility
-              bool dst_check = resolveSystemName(amsg->sys_dst) == getSystemId();                    //Specific destination
-              dst_check |= ((amsg->sys_dst == "broadcast") & (amsg->getSource() != getSystemId()));  //All
-              if(dst_check && amsg->mtype == m_args.mtype)
+              if(toParse(amsg))
               {
                 // Check range
                 fp64_t d = distance(amsg);
