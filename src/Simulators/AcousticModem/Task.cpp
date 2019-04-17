@@ -76,9 +76,6 @@ namespace Simulators
       //! Task arguments.
       Arguments m_args;
 
-      //! Static device flag.
-      bool m_fixed_location;
-
       //! UDP socket.
       UDPSocket* m_sock;
       //! UDP message buffer.
@@ -95,7 +92,6 @@ namespace Simulators
 
       Task(const std::string& name, Tasks::Context& ctx):
         Tasks::Task(name, ctx),
-        m_fixed_location(false),
         m_sock(0),
         m_prng(NULL)
       {
@@ -107,10 +103,6 @@ namespace Simulators
         .defaultValue("8021")
         .description("UDP port for communications");
 
-        param("Fixed Location", m_args.location)
-        .defaultValue("")
-        .description("WGS84 latitude and longitude for node with fixed position");
-
         param("Modem Type", m_args.mtype)
         .description("Vehicle modem type (Ex. Evologics, Seatrac)");
 
@@ -118,7 +110,7 @@ namespace Simulators
         .description("Modem transmission speed (bps)");
 
         param("Distance Standard Deviation", m_args.dst_peak_width)
-        .defaultValue("1000");
+        .defaultValue("750");
 
         param("Size Standard Deviation", m_args.dsize_peak_width)
         .defaultValue("21");
@@ -130,6 +122,7 @@ namespace Simulators
         .defaultValue("-1");
 
         // Register consumers.
+        bind<IMC::GpsFix>(this);
         bind<IMC::SimulatedState>(this);
         bind<IMC::UamTxFrame>(this);
       }
@@ -137,19 +130,6 @@ namespace Simulators
       ~Task(void)
       {
         onResourceRelease();
-      }
-
-      void
-      onUpdateParameters(void)
-      {
-        if (m_args.location.size() == 2)
-        {
-          m_fixed_location = true;
-          m_lstate.clear();
-          m_lstate.lat = Angles::radians(m_args.location[0]);
-          m_lstate.lon = Angles::radians(m_args.location[1]);
-          m_lstate.z = 0;
-        }
       }
 
       void
@@ -261,7 +241,7 @@ namespace Simulators
         fp64_t toa = amsg->getTimeStamp()   //Start sending
                     + d/c_sound_speed;      //Travel time
         // Time of delivery
-        fp64_t tod = toa + amsg->txtime     //Time to send last bit
+        fp64_t tod = toa + amsg->txtime;    //Time to send last bit
 
         // If t.o.d. has passed: dispatch; otherwise: queue
         if(tod <= Clock::getSinceEpoch())
@@ -320,11 +300,26 @@ namespace Simulators
       }
 
       void
+      consume(const IMC::GpsFix* msg)
+      {
+        if (msg->type != IMC::GpsFix::GFT_MANUAL_INPUT)
+          return;
+
+        if(!isActive())
+          requestActivation();
+
+        // Define vehicle origin.
+        m_lstate.lat = msg->lat;
+        m_lstate.lon = msg->lon;
+        m_lstate.height = msg->height;
+        m_lstate.x = 0;
+        m_lstate.y = 0;
+        m_lstate.z = 0;
+      }
+
+      void
       consume(const IMC::SimulatedState* msg)
       {
-        if(m_fixed_location)
-          return;
-        
         if(!isActive())
           requestActivation();
 
