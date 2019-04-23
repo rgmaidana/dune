@@ -43,6 +43,16 @@ namespace Simulators
   {
     using DUNE_NAMESPACES;
 
+    // Environmental constants
+    static const double c_sound_speed = 1500;
+    static const double c_max_range = 3000;
+
+    enum Codes
+    {
+      CODE_RANGE    = 0x01,
+      CODE_REPLY    = 0x07
+    };
+
     struct Arguments
     {
       //! Multicast Address
@@ -59,17 +69,14 @@ namespace Simulators
       int tx_speed;
 
       //! Standard deviation for distance probability.
-      fp32_t dst_peak_width;
+      float dst_peak_width;
       //! Standard deviation for data size probability.
-      fp32_t dsize_peak_width;
+      float dsize_peak_width;
       //! PRNG type.
       std::string prng_type;
       //! PRNG seed.
       int prng_seed;
     };
-
-    static const double c_sound_speed = 1500;
-    static const double c_max_range = 3000;
 
     struct Task: public Tasks::Task
     {
@@ -82,11 +89,12 @@ namespace Simulators
       uint8_t m_buf[1024];
 
       //! Delivery queue.
-      //! <time of delivery, message to release*>
-      typedef std::map<double, IMC::UamRxFrame*> ReceiveMap;
+      //! <time of delivery, message*>
+      typedef std::map<double, const IMC::SAMessage*> ReceiveMap;
       ReceiveMap m_queue;
+
       //! Local simulated state.
-      IMC::SimulatedState m_lstate;      
+      IMC::SimulatedState m_lstate;
       //! PRNG handle.
       Random::Generator* m_prng;
 
@@ -135,17 +143,17 @@ namespace Simulators
       void
       onResourceAcquisition(void)
       {
-        //Initialize UDP socket in multicast
+        // Initialize UDP socket in multicast
         m_sock = new DUNE::Network::UDPSocket();
         m_sock->setMulticastTTL(1);
         m_sock->setMulticastLoop(true);
         m_sock->joinMulticastGroup(m_args.udp_maddr);
         m_sock->bind(m_args.udp_port);
 
-        //Initialize random number generator
+        // Initialize random number generator
         m_prng = Random::Factory::create(m_args.prng_type, m_args.prng_seed);
 
-        //Deactivate until SimulatedState message is received
+        // Deactivate until SimulatedState message is received
         requestDeactivation();
       }
 
@@ -160,7 +168,7 @@ namespace Simulators
 
         Memory::clear(m_prng);
         ReceiveMap::iterator it = m_queue.begin();
-        for(; it != m_queue.end(); ++it)
+        for (; it != m_queue.end(); ++it)
           Memory::clear(it->second);
       }
 
@@ -173,99 +181,121 @@ namespace Simulators
         m_sock->write(m_buf, n, m_args.udp_maddr, m_args.udp_port);
       }
 
+      void
+      buildSAMessage(IMC::SAMessage &amsg, const IMC::UamTxFrame* msg)
+      {
+        // Construct simulated acoustic message from TxFrame
+        buildSAMessage(amsg, msg->seq, msg->sys_dst, msg->flags, msg->data);
+      }
+
+      void
+      buildSAMessage(IMC::SAMessage &amsg, uint16_t seq, 
+                      std::string sys_dst, uint8_t flags, std::vector<char> data)
+      {
+        // Construct simulated acoustic message metadata
+        Coordinates::toWGS84(m_lstate, amsg.lat, amsg.lon);
+        amsg.depth = m_lstate.z;
+        amsg.mtype = m_args.mtype;
+        amsg.txtime = data.size()*8/m_args.tx_speed;
+
+        // Copy UamTxFrame data
+        amsg.seq = seq;
+        amsg.sys_dst = sys_dst;
+        amsg.flags = flags;
+        amsg.data = data;
+
+        // Set header
+        amsg.setSource(getSystemId());
+        amsg.setTimeStamp();
+      }
+
+      // Parse SAMessage into UamRxFrame
+      void
+      buildRxFrame(IMC::UamRxFrame &rx, const IMC::SAMessage* amsg)
+      {
+        rx.sys_src = resolveSystemId(amsg->getSource());
+        rx.sys_dst = getSystemName();
+        rx.flags = amsg->flags;
+        rx.data = amsg->data;
+        rx.setTimeStamp();
+      }
+
+      // Parse SAMessage into UamRxFrame
+      void
+      buildRxRange(IMC::UamRxRange &range, const IMC::SAMessage* amsg)
+      {
+        range.sys = resolveSystemId(amsg->getSource());
+        range.seq = amsg->seq;
+        range.value = distance(amsg);
+        range.setTimeStamp();
+      }
+
+        return 0;
+      }
+
+      // Build and send reply to range request
+      void
+      sendRangeReply(const IMC::SAMessage* amsg)
+      {
+        IMC::SAMessage range_reply;
+
+        // Message never gets to UAN as RxFrame, CRC8 not needed
+        std::vector<char> data = amsg->data;
+        data[1] = CODE_REPLY;
+        buildSAMessage(range_reply, amsg->seq, 
+                        resolveSystemId(amsg->getSource()), 
+                        0x00,
+                        data);
+
+        // Send reply
+        share(&range_reply);
+      }
+
       // Compute distance to source vehicle
       double
-      distance(IMC::SAMessage* src_state)
+      distance(const IMC::SAMessage* src_state)
       {
-        //Convert to absolute coordinates
-        fp64_t llat, llon;
+        // Convert to absolute coordinates
+        double llat, llon;
         Coordinates::toWGS84(m_lstate, llat, llon);
 
         return WGS84::distance(llat, llon, m_lstate.z,
                                src_state->lat, src_state->lon, src_state->depth);
       }
 
-      // Simulate delivery failures gausian distribution of distance
-      bool
-      deliverySucceeds(fp64_t distance, uint16_t data_size)
-      {
-        // Out of range
-        if(distance > c_max_range)
-          return 0;
-        
-        // Gaussian profiles
-        fp32_t dist_prob = exp(-1 * (distance*distance)/(2 * m_args.dst_peak_width * m_args.dst_peak_width));
-        fp32_t size_prob = exp(-1 * (fp32_t)(data_size*data_size)/
-                                (2 * m_args.dsize_peak_width * m_args.dsize_peak_width));
-
-        return m_prng->uniform() <= dist_prob*size_prob;
-      }
-
-      //Check collisions
-      bool
-      checkCollisions(fp64_t toa)
-      {
-        // Check all messages for collisions
-        ReceiveMap::iterator it = m_queue.begin();
-        for(; it != m_queue.end(); ++it)
-        {
-          //If a new message arrives during the rxtime of another message
-          fp64_t q_tod = it->first;
-          fp64_t msg_size = (fp64_t)it->second->data.size()*8;
-          fp64_t q_txtime = msg_size/m_args.tx_speed;
-          fp64_t q_toa = q_tod - q_txtime;
-          if(toa > q_toa && toa < q_tod)
-          {
-            // Erase message
-            delete it->second;
-            m_queue.erase(it);
-            return 1;
-          }
-        }
-
-        return 0;
-      }
-
-      // Parse SAMessage into UamRxFrame and add to queue
-      void
-      parseRx(IMC::SAMessage* amsg, fp64_t d)
-      {
-        // Create UamRxFrame
-        IMC::UamRxFrame* rx = new UamRxFrame;
-        rx->sys_src = resolveSystemId(amsg->getSource());
-        rx->sys_dst = getSystemName();
-        rx->flags = amsg->flags;
-        rx->data = amsg->data;
-
-        // Time of arrival
-        fp64_t toa = amsg->getTimeStamp()   //Start sending
-                    + d/c_sound_speed;      //Travel time
-        // Time of delivery
-        fp64_t tod = toa + amsg->txtime;    //Time to send last bit
-
-        // If t.o.d. has passed: dispatch; otherwise: queue
-        if(tod <= Clock::getSinceEpoch())
-          dispatch(rx);
-        else if(!checkCollisions(toa))
-          m_queue.insert(std::pair<double, UamRxFrame*>(tod, rx));
-      }
-
-      //Check if there are messages to deliver
+      // Check if there are messages to deliver
       void
       checkMessages()
       {
         // Check all messages
         ReceiveMap::iterator it = m_queue.begin();
-        for(; it != m_queue.end(); ++it)
-          if(it->first <= Clock::getSinceEpoch())
+        for (; it != m_queue.end(); ++it)
+          if (it->first <= Clock::getSinceEpoch())
           {
-            // Set time and dispatch
-            IMC::UamRxFrame* msg = it->second;
-            msg->setTimeStamp();
-            dispatch(msg);
+            const IMC::SAMessage* amsg = it->second;
+            if (amsg->data[1] != CODE_REPLY)
+            {
+              // Set time and dispatch
+              IMC::UamRxFrame msg;
+              buildRxFrame(msg, amsg);
+              dispatch(msg);
+
+              // Range request
+              if (amsg->data[1] == CODE_RANGE)
+              {
+                sendRangeReply(amsg);
+              }
+            }
+            else
+            {
+              // Construct UamRxRange
+              IMC::UamRxRange range;
+              buildRxRange(range, amsg);
+              dispatch(range);
+            }
 
             // Erase message
-            delete msg;
+            delete amsg;
             m_queue.erase(it);
           }
       }
@@ -279,16 +309,7 @@ namespace Simulators
 
         // Construct simulated acoustic message metadata
         IMC::SAMessage amsg;
-        Coordinates::toWGS84(m_lstate, amsg.lat, amsg.lon);
-        amsg.depth = m_lstate.z;
-        amsg.mtype = m_args.mtype;
-        amsg.txtime = msg->data.size()*8/m_args.tx_speed;
-
-        // Copy UamTxFrame data
-        amsg.seq = msg->seq;
-        amsg.sys_dst = msg->sys_dst;
-        amsg.flags = msg->flags;
-        amsg.data = msg->data;
+        buildSAMessage(amsg, msg);
 
         // Send
         amsg.setSource(getSystemId());
@@ -296,6 +317,7 @@ namespace Simulators
         share(&amsg);
 
         //Send to bus (Logging)
+        // Send to bus (Logging)
         dispatch(amsg);
       }
 
@@ -305,7 +327,7 @@ namespace Simulators
         if (msg->type != IMC::GpsFix::GFT_MANUAL_INPUT)
           return;
 
-        if(!isActive())
+        if (!isActive())
           requestActivation();
 
         // Define vehicle origin.
@@ -320,7 +342,7 @@ namespace Simulators
       void
       consume(const IMC::SimulatedState* msg)
       {
-        if(!isActive())
+        if (!isActive())
           requestActivation();
 
         m_lstate = *msg;
@@ -340,19 +362,77 @@ namespace Simulators
         }
       }
 
-      // Check if message id to be parsed
+      // Check if message should be parsed
       bool
       toParse(IMC::SAMessage* amsg)
       {
-        //Check destination
+        // Check destination
         bool check;
-        check = resolveSystemName(amsg->sys_dst) == getSystemId();                          //Specific destination
-        check |= ((amsg->sys_dst == "broadcast") & (amsg->getSource() != getSystemId()));   //or All
+        check = resolveSystemName(amsg->sys_dst) == getSystemId();                          // Specific destination
+        check |= ((amsg->sys_dst == "broadcast") & (amsg->getSource() != getSystemId()));   // or All
 
-        //Check modem compatibility
+        // Check modem compatibility
         check &= amsg->mtype == m_args.mtype;
 
         return check;
+      }
+
+      // Simulate delivery failures gausian distribution of distance
+      bool
+      deliverySucceeds(double distance, uint16_t data_size)
+      {
+        // Out of range
+        if (distance > c_max_range)
+          return 0;
+        
+        // Gaussian profiles
+        float dist_prob = exp(-1 * (distance*distance)/(2 * m_args.dst_peak_width * m_args.dst_peak_width));
+        float size_prob = exp(-1 * (float)(data_size*data_size)/
+                                (2 * m_args.dsize_peak_width * m_args.dsize_peak_width));
+
+        return m_prng->uniform() <= dist_prob*size_prob;
+      }
+
+      // Check collisions
+      bool
+      checkCollisions(double toa, double tod)
+      {
+        // Check all messages for collisions
+        ReceiveMap::iterator it = m_queue.begin();
+        for (; it != m_queue.end(); ++it)
+        {
+          // If a new message arrives during the reception 
+          // time interval [toa tod] of another message
+          double q_tod = it->first;
+          double q_txtime = it->second->txtime;
+          double q_toa = q_tod - q_txtime;
+          if (!(toa > q_tod || tod < q_toa))
+          {
+            // Erase message
+            delete it->second;
+            m_queue.erase(it);
+            return 1;
+          }
+        }
+
+        return 0;
+      }
+
+      // Send SAMessage to queue
+      void
+      sendToQueue(IMC::SAMessage* amsg, double d)
+      {
+        // Clone message
+        IMC::SAMessage* msg = amsg->clone();
+
+        // Time of arrival
+        double toa = amsg->getTimeStamp()   // Start sending
+                    + d/c_sound_speed;      // Travel time
+        // Time of delivery
+        double tod = toa + amsg->txtime;    // Time to send last bit
+
+        if (!checkCollisions(toa, tod))
+          m_queue.insert(std::pair<double, SAMessage*>(tod, msg));
       }
 
       void
@@ -369,16 +449,16 @@ namespace Simulators
             IMC::Message* m = IMC::Packet::deserialize(m_buf, n);
 
             // Check if msg is simulated acoustic msg
-            if(m->getId() == DUNE_IMC_SAMESSAGE)
+            if (m->getId() == DUNE_IMC_SAMESSAGE)
             {
               IMC::SAMessage* amsg = static_cast<IMC::SAMessage*>(m);
 
-              if(toParse(amsg))
+              if (toParse(amsg))
               {
                 // Check range
-                fp64_t d = distance(amsg);
-                if(deliverySucceeds(d, amsg->data.size()))
-                  parseRx(amsg, d);
+                double d = distance(amsg);
+                if (deliverySucceeds(d, amsg->data.size()))
+                  sendToQueue(amsg, d);
               }
             }
             else
@@ -388,7 +468,7 @@ namespace Simulators
             delete m;
           }
         }
-        catch (std::runtime_error& e)
+        catch(std::runtime_error& e)
         {
           err(DTR("read error: %s"), e.what());
         }
