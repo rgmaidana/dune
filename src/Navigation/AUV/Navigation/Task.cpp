@@ -189,11 +189,14 @@ namespace Navigation
         Arguments m_args;
         //! Heading alignment buffer
         int m_heading_buffer;
-        bool imu_time_to_Sync_flag;
+        //! IMU time synching flag.
+        bool m_synching_imu;
         //! Pointer to speed model for speed conversions
         const Plans::SpeedModel* m_speed_model;
-
-        double m_last, m_last_ahrs ;
+        //! IMU sync start time.
+        double m_last_imu;
+        //! AHRS update period. 
+        double m_last_ahrs;
 
         Task(const std::string& name, Tasks::Context& ctx):
           DUNE::Navigation::BasicNavigation(name, ctx),
@@ -316,8 +319,8 @@ namespace Navigation
           m_kal.reset(NUM_STATE, NUM_OUT);
           resetKalman();
           m_heading_buffer=0;
-          imu_time_to_Sync_flag = false;
-          m_last = 0.0;
+          m_synching_imu = false;
+          m_last_imu = 0.0;
 
           // Register callbacks
           bind<IMC::EntityActivationState>(this);
@@ -425,8 +428,7 @@ namespace Navigation
             if (m_dead_reckoning_sync)
               return;
             m_dead_reckoning_sync = true;
-            imu_time_to_Sync_flag= false;
-              //eulerdela active d
+            m_synching_imu = false;
           }
           else
           {
@@ -434,8 +436,6 @@ namespace Navigation
               return;
 
             imuDeActivateDeadReckoning();
-            m_dead_reckoning_sync =false;
-            m_dead_reckoning_delta =false;
           }
         }
 
@@ -469,14 +469,16 @@ namespace Navigation
         imuDeActivateDeadReckoning(void)
         {
             // Stop integrate heading rates and use AHRS data.
-            //todo start timer ahrs
+            // Reset IMU sync flags
+            m_dead_reckoning_sync =false;
+            m_dead_reckoning_delta =false;
             m_dead_reckoning = false;
             m_aligned = false;
             debug("navigation not aligned");
             m_last_ahrs = -1;
-            m_kal.setState(STATE_PSI_BIAS, 0.0);
 
             // No heading offset estimation without IMU.
+            m_kal.setState(STATE_PSI_BIAS, 0.0);
             m_kal.resetCovariance(STATE_PSI_BIAS);
 
             // Reinitialize EKF variances.
@@ -638,30 +640,28 @@ namespace Navigation
           double hrate = getHeadingRate();
           m_z_anglle = hrate;
 
-         double  time_ahrs = -1;
-         if(m_dead_reckoning)
-         {
-          time_ahrs= Time::Clock::get()- m_last_ahrs;
-         }
-
-         if( (m_args.ahrs_time_update < time_ahrs && m_dead_reckoning) || !m_dead_reckoning )
-         {
+          double  time_ahrs = -1;
           if(m_dead_reckoning)
-          {
-            inf(DTR("AHRS_update"));
-            m_last_ahrs =Time::Clock::get();
-          } 
-           m_heading += Angles::minSignedAngle(m_heading, Angles::normalizeRadian(getEuler(AXIS_Z)));
-           m_kal.setOutput(OUT_PSI, m_heading);
-           m_kal.setInnovation(OUT_PSI, m_kal.getOutput(OUT_PSI) - getBiasedHeading());
-    
-         }
-         else
-         {
-            m_kal.setObservation(OUT_PSI, STATE_PSI, 0.0);
-         }
+            time_ahrs = Time::Clock::get() - m_last_ahrs;
 
-          
+          if( (m_args.ahrs_time_update < time_ahrs && m_dead_reckoning) || !m_dead_reckoning )
+          {
+            if(m_dead_reckoning)
+            {
+              inf(DTR("AHRS_update"));
+              m_last_ahrs = Time::Clock::get();
+            } 
+
+            m_heading += Angles::minSignedAngle(m_heading, Angles::normalizeRadian(getEuler(AXIS_Z)));
+            m_kal.setOutput(OUT_PSI, m_heading);
+            m_kal.setInnovation(OUT_PSI, m_kal.getOutput(OUT_PSI) - getBiasedHeading());
+          }
+          else
+          {
+            m_kal.setObservation(OUT_PSI, STATE_PSI, 0.0);
+          }
+
+            
           m_kal.setOutput(OUT_R, hrate);
           double r = m_kal.getState(STATE_R) + m_kal.getState(STATE_R_BIAS);
           m_kal.setInnovation(OUT_R,  m_kal.getOutput(OUT_R) - r);
@@ -792,21 +792,26 @@ namespace Navigation
 
           double time_imu_delta = 0;
 
-          if (imu_time_to_Sync_flag)
+          if (m_synching_imu)
+            time_imu_delta = Time::Clock::get() - m_last_imu;
+
+          if (m_dead_reckoning_sync   && 
+              m_dead_reckoning_delta  && 
+              !m_dead_reckoning       && 
+              !m_synching_imu)
           {
-            time_imu_delta= Time::Clock::get()- m_last;
+            m_last_imu =Time::Clock::get();
+            m_synching_imu = true;
           }
 
-          if(m_dead_reckoning_sync && !m_dead_reckoning && m_dead_reckoning_delta && !imu_time_to_Sync_flag)
-          {
-             m_last =Time::Clock::get();
-              imu_time_to_Sync_flag = true;
-          }
-
-          if(imu_time_to_Sync_flag && m_dead_reckoning_sync && !m_dead_reckoning && m_dead_reckoning_delta && time_imu_delta > m_args.imu_time_to_Sync )
+          if (m_synching_imu          && 
+              m_dead_reckoning_sync   && 
+              m_dead_reckoning_delta  && 
+              !m_dead_reckoning       && 
+              time_imu_delta > m_args.imu_time_to_Sync )
           {
             imuActivateDeadReckoning();
-            imu_time_to_Sync_flag=false;
+            m_synching_imu=false;
           }
         }
 
