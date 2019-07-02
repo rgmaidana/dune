@@ -486,7 +486,7 @@ namespace DUNE
 
       if(!m_dead_reckoning_sync)
         return;
-      m_dead_reckoning_delta = true;
+
       if (std::fabs(msg->x) > Math::c_pi / 10.0 ||
           std::fabs(msg->y) > Math::c_pi / 10.0 ||
           std::fabs(msg->z) > Math::c_pi / 10.0)
@@ -495,6 +495,8 @@ namespace DUNE
             msg->x, msg->y, msg->z);
         return;
       }
+
+      m_dead_reckoning_delta = true;
 
       m_edelta_bfr[AXIS_X] += msg->x;
       m_edelta_bfr[AXIS_Y] += msg->y;
