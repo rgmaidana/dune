@@ -267,7 +267,8 @@ namespace DUNE
           r = getAngularVelocity(AXIS_Z);
         }
 
-        extractEarthRotation(p, q, r);
+        if (!m_earth_disable)
+          extractEarthRotation(p, q, r);
 
         return (std::sin(roll) * q + std::cos(roll) * r) / std::cos(pitch);
       }
@@ -667,6 +668,8 @@ namespace DUNE
       std::string m_elabel_dvl;
       //! GPS disable for debug
       bool m_gps_disable;
+      //! ExtractEarthRotation disable for debug
+      bool m_earth_disable;
       //! Altitude entity label hardware.
       std::string m_elabel_alt_hard;
       //! Altitude entity label simulation.

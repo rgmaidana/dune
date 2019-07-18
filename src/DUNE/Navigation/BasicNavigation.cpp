@@ -79,6 +79,10 @@ namespace DUNE
       .defaultValue("false")
       .description("Disable GPS for debug");
 
+      param("Disable ExtractEarthRotation for debug", m_earth_disable)
+      .defaultValue("false")
+      .description("Disable ExtractEarthRotation for debug");
+
       param("GPS timeout", m_without_gps_timeout)
       .units(Units::Second)
       .defaultValue("3.0")
