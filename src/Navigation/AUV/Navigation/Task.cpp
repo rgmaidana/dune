@@ -659,6 +659,7 @@ namespace Navigation
           else
           {
             m_kal.setObservation(OUT_PSI, STATE_PSI, 0.0);
+            m_kal.setObservation(OUT_PSI, STATE_PSI_BIAS, 0.0);
           }
 
             
