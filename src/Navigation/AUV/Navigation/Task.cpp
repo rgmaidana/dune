@@ -653,10 +653,7 @@ namespace Navigation
           if( (m_args.ahrs_time_update < time_ahrs && m_dead_reckoning) || !m_dead_reckoning )
           {
             if(m_dead_reckoning)
-            {
-              inf(DTR("AHRS_update"));
               m_last_ahrs = Time::Clock::get();
-            } 
 
             m_heading += Angles::minSignedAngle(m_heading, Angles::normalizeRadian(getEuler(AXIS_Z)));
             m_kal.setOutput(OUT_PSI, m_heading);
