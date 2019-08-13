@@ -228,10 +228,10 @@ namespace Navigation
           .size(6)
           .description("Kalman Filter process noise covariance values");
 
-          param("Measure Noise Covariance imu with AHRS", m_observation_noise_imu)
+          param("Heading Noise Covariance with IMU", m_observation_noise_imu)
           .defaultValue("")
           .size(2)
-          .description("Measure Noise Covariance imu with AHRS");
+          .description("Heading Noise Covariance with IMU");
 
           param("GPS Noise Covariance", m_args.gps_noise)
           .defaultValue("")
