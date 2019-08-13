@@ -152,6 +152,7 @@ namespace Sensors
           copyTo(m_euler, m_ang_last);
           copyTo(m_euler, m_ang_earth_f);
           copyTo(m_euler, m_ang_earth_r);
+          copyTo(m_euler, m_euler_earth);
         }
 
         m_edelta_bfr_f[AXIS_X] += msg->x;
