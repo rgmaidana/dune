@@ -53,6 +53,7 @@ namespace Sensors
       /* Generic member variables */
       bool m_dead_reckoning;
       bool m_dead_reckoning_sync;
+      bool m_ahrs_sync;
       unsigned m_imu_eid;
       unsigned m_ahrs_eid;
       double m_declination;
@@ -90,6 +91,7 @@ namespace Sensors
         m_declination = 0.0;
         m_last_lat = 0.0;
         m_tstep = 1 / getFrequency();
+        m_ahrs_sync = false;
 
         resetBuffer(m_edelta_bfr_f);
         resetBuffer(m_edelta_bfr_r);
@@ -135,6 +137,9 @@ namespace Sensors
       consume(const IMC::EulerAnglesDelta* msg)
       {
         if (!m_dead_reckoning_sync || msg->getSourceEntity() != m_imu_eid)
+          return;
+
+        if (!m_ahrs_sync)
           return;
 
         if (!m_dead_reckoning)
@@ -187,6 +192,12 @@ namespace Sensors
       {
         if (msg->getSource() != getSystemId() || msg->getSourceEntity() != m_ahrs_eid)
           return;
+
+        if (!m_ahrs_sync)
+        {
+          m_ahrs_sync = true;
+          inf("AHRS synced");
+        }
 
         copyTo(*msg, m_euler);
 
@@ -308,7 +319,7 @@ namespace Sensors
         if (m_tstep < 0)
           return;
 
-        if (!m_dead_reckoning)
+        if (!m_dead_reckoning || !m_ahrs_sync)
           return;
 
         // latest euler angles with declination correction.
