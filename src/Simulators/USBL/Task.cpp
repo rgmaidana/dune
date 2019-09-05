@@ -24,7 +24,7 @@
 // https://github.com/LSTS/dune/blob/master/LICENCE.md and                  *
 // http://ec.europa.eu/idabc/eupl.html.                                     *
 //***************************************************************************
-// Author: Pedro Calado                                                     *
+// Authors: Pedro Calado / Renan Maidana / Luis Venancio                    *
 //***************************************************************************
 
 // ISO C++ 98 headers.
@@ -41,10 +41,6 @@ namespace Simulators
 
     struct Arguments
     {
-      //! PRNG type.
-      std::string prng_type;
-      //! PRNG seed.
-      int prng_seed;
       //! USBL latitude coordinate
       double usbl_lat;
       //! USBL longitude coordinate
@@ -78,10 +74,6 @@ namespace Simulators
       IMC::EntityState m_ent;
       //! Current position.
       IMC::SimulatedState m_sstate;
-      //! A device binary message for now
-      IMC::DevDataBinary m_dev;
-      //! PRNG handle.
-      Random::Generator* m_prng;
       //! North offset of the USBL acoustic transducer
       double m_usbl_off_n;
       //! East offset of the USBL acoustic transducer
@@ -89,18 +81,14 @@ namespace Simulators
       //! Task Arguments.
       Arguments m_args;
 
+      //! Vector holding distances reported by the acoustic modem 
+      std::vector<double> usbl_distances;
+      //! Debug string to see who sent the range messages back
+      std::string destRange;
+
       Task(const std::string& name, Tasks::Context& ctx):
-        Tasks::Periodic(name, ctx),
-        m_prng(NULL)
+        Tasks::Periodic(name, ctx)
       {
-        param("PRNG Type", m_args.prng_type)
-        .defaultValue(Random::Factory::c_default)
-        .description("Type of the random generator");
-
-        param("PRNG Seed", m_args.prng_seed)
-        .defaultValue("-1")
-        .description("Seed number for the generator");
-
         param("Latitude", m_args.usbl_lat)
         .defaultValue("0.0")
         .units(Units::Degree)
@@ -139,7 +127,7 @@ namespace Simulators
         setEntityState(IMC::EntityState::ESTA_BOOT, Status::CODE_WAIT_GPS_FIX);
 
         bind<IMC::GpsFix>(this);
-        bind<IMC::SimulatedState>(this);
+        bind<IMC::UamRxRange>(this);
       }
 
       void
@@ -166,18 +154,6 @@ namespace Simulators
       }
 
       void
-      onResourceAcquisition(void)
-      {
-        m_prng = Random::Factory::create(m_args.prng_type, m_args.prng_seed);
-      }
-
-      void
-      onResourceRelease(void)
-      {
-        Memory::clear(m_prng);
-      }
-
-      void
       consume(const IMC::GpsFix* msg)
       {
         if (msg->type != IMC::GpsFix::GFT_MANUAL_INPUT)
@@ -188,87 +164,37 @@ namespace Simulators
                             &m_usbl_off_n, &m_usbl_off_e);
 
         trace("offsets to navigational reference | %0.2f %0.2f", m_usbl_off_n, m_usbl_off_e);
+        
+        // Here we see the displacement between the modem's gps position and the USBL sensor
+        inf("Offsets to navigational reference - North: %0.2f | East: %0.2f", m_usbl_off_n, m_usbl_off_e);
 
         setEntityState(IMC::EntityState::ESTA_NORMAL, Status::CODE_ACTIVE);
       }
 
+      // After we send a "ping" through the AcousticModem, we receive and consume a UamRxRange,
+      // dispatched by the AcousticModem itself. With the distance reported, we can do some stuff (TBD)
       void
-      consume(const IMC::SimulatedState* msg)
-      {
-        m_sstate = *msg;
+      consume(const IMC::UamRxRange* msg){
+          inf("Added range %f to the distance vector", msg->value);
+          usbl_distances.push_back(msg->value);
+          if (usbl_distances.size() == 10)
+            inf("Finished obtaining ranges from %s", msg->sys.c_str());
+      }
 
-        if ((msg->getTimeStamp() - m_dev.getTimeStamp() > m_args.trans_delay) &&
-            !m_dev.value.empty())
-        {
-          USBLMessage temp;
-          std::memcpy((void*)&temp, (const void*)&m_dev.value[0], sizeof(temp));
+      void task(void){
+        if (getEntityState() != IMC::EntityState::ESTA_NORMAL)
+            return;   // Did not get GpsFix message
 
-          spew("Range: %.2f m", temp.range);
-          spew("Bearing: %.2f deg", Angles::degrees(temp.bearing));
-          spew("Elevation: %.2f deg", Angles::degrees(temp.elevation));
-          spew("Delay: %.2f sec", msg->getTimeStamp() - m_dev.getTimeStamp());
-
-          dispatch(m_dev, DF_KEEP_TIME);
-
-          m_dev.value.clear();
+        // As we are sending UamTxFrame messages, the AcousticModem won't send new messages if it
+        // is in the "busy" state, so we don't have to worry about waiting to transmit a new message
+        // If the last range has been received, send another "ping" to some vehicle
+        // Don't send if the distances vector is complete
+        if (usbl_distances.size() < 10){
+          IMC::UamTxFrame uamMsg;
+          uamMsg.sys_dst = "lauv-noptilus-2";
+          uamMsg.flags = IMC::UamTxFrame::UTF_ACK;
+          dispatch(uamMsg);
         }
-      }
-
-      void
-      task(void)
-      {
-        if (m_ent.state != IMC::EntityState::ESTA_NORMAL)
-          return;  // Home ref not setup
-
-        USBLMessage msg;
-        getSensorData(&msg);
-
-        // fill in message fields but clear it first
-        m_dev.clear();
-
-        uint8_t* ptr = (uint8_t*)&msg;
-        m_dev.value = std::vector<char>(ptr, ptr + sizeof(msg) / sizeof(uint8_t));
-        m_dev.setTimeStamp();
-      }
-
-      //! Compute simulated sensor data using data from manufacturer
-      void
-      getSensorData(USBLMessage* msg) const
-      {
-        double real_bearing, real_range_2d;
-        // this is the absolute bearing
-        getRealBearingAndRange(&real_bearing, &real_range_2d);
-        // to turn it into the relative bearing
-        real_bearing = Angles::normalizeRadian(m_args.usbl_heading - real_bearing);
-
-        // Adding noise to bearing
-        msg->bearing = Angles::normalizeRadian(real_bearing + m_prng->gaussian() * m_args.usbl_bearing_res);
-
-        // Computing elevation angle
-        msg->elevation = std::atan2(m_sstate.z - m_args.usbl_depth, real_range_2d);
-        // Adding noise using the same stdev as bearing's
-        msg->elevation = Angles::normalizeRadian(msg->elevation + m_prng->gaussian() * m_args.usbl_bearing_res);
-
-        // actual range in 3d
-        msg->range = norm(real_range_2d, m_sstate.z - m_args.usbl_depth);
-        // Adding noise
-        msg->range += m_prng->gaussian() * m_args.usbl_slant_acc / 2;
-      }
-
-      //! Compute actual bearing angle and range from USBL transducer to vehicle
-      void
-      getRealBearingAndRange(double* bearing, double* range) const
-      {
-        double diff_e = m_sstate.y - m_usbl_off_e;
-        double diff_n = m_sstate.x - m_usbl_off_n;
-
-        // Special case
-        if (diff_n == 0.0)
-          *bearing = -m_args.usbl_heading;
-        else
-          *bearing = std::atan2(diff_e, diff_n);
-
-        *range = std::sqrt( diff_e * diff_e + diff_n * diff_n );
       }
     };
   }
